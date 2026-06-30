@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import json, os, shutil, re, random, io, requests, ctypes, sys, time, struct
+import json, os, shutil, re, random, io, requests, ctypes, sys, time, struct, subprocess
+import swanlab
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,13 +9,13 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-model_path = "/data2/Qwen/Qwen2.5-7B"
-gen_device = 4    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
+model_path = "./models/Qwen/Qwen2.5-3B"
+gen_device = 7    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
 beta = 0.04
 all_steps = 1000
 Q_batch_size = 5
 num_pre_Q = 8
-train_batch_size = 8
+train_batch_size = 1
 gen_update_steps = 16
 save_steps = 200
 compute_gen_logps = True
@@ -22,9 +23,15 @@ clip_param = 0.2
 ref_server = "http://localhost:59875"
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
 
+def log_gpu_memory():
+    r = subprocess.run(['nvidia-smi', '--query-gpu=index,memory.used,memory.total', '--format=csv,noheader,nounits'], capture_output=True, text=True)
+    for line in r.stdout.strip().split('\n'):
+        gpu_id, used, total = line.split(',')
+        print(f"  GPU {gpu_id.strip()}: {used.strip()} / {total.strip()} MiB")
+
 ds_config = {
     "train_micro_batch_size_per_gpu": train_batch_size,
-    "gradient_accumulation_steps": 4,
+    "gradient_accumulation_steps": 16,
     "optimizer": {
         "type": "AdamW",
         "params": { "lr": 1e-6 }
@@ -87,10 +94,11 @@ def GRPO_step(batch):
         assert compute_gen_logps is False
     per_token_loss = -(per_token_loss - beta * per_token_kl)
     loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-    return loss
+    avg_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+    return loss, avg_kl
 
 
-def gen_worker(Q, physics_device):
+def gen_worker(Q, physics_device, info_Q):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
     cleanup_keys = [  
@@ -107,7 +115,7 @@ def gen_worker(Q, physics_device):
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
     from vllm import LLM, SamplingParams
-    vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.5)
+    vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.4)
     ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
 
     sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
@@ -181,6 +189,10 @@ def gen_worker(Q, physics_device):
         prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
         print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, )
         if it % 5 == 0: print('answers:', answers[0])
+        rw = torch.tensor(rewards)
+        info_Q.put({'reward_mean': rw.mean().item(), 'reward_max': rw.max().item(),
+                     'reward_min': rw.min().item(), 'reward_acc': (rw > 0).float().mean().item(),
+                     'sample_answer': answers[0][:500]})
 
         for i, pp in enumerate(prompt_inputs):
             prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
@@ -226,8 +238,17 @@ if __name__ == '__main__':
         print('\nSTART vLLM generation...\n')
         mp.set_start_method('spawn')
         Q = mp.Queue()
-        p = mp.Process(target=gen_worker, args=(Q, gen_device))
-        p.start()
+        info_Q = mp.Queue()
+        def launch_gen():
+            pp = mp.Process(target=gen_worker, args=(Q, gen_device, info_Q))
+            pp.start()
+            return pp
+        p = launch_gen()
+        swanlab.init(project="GRPO-GSM8K", experiment_name=f"Qwen2.5-3B_{time.strftime('%m%d_%H%M')}",
+                      config={'model': model_path, 'lr': 1e-6, 'beta': beta, 'clip': clip_param,
+                              'batch_size': train_batch_size, 'grad_acc': ds_config['gradient_accumulation_steps'],
+                              'gen_update_steps': gen_update_steps, 'num_pre_Q': num_pre_Q,
+                              'Q_batch_size': Q_batch_size, 'max_tokens': 700})
 
     model = AutoModelForCausalLM.from_pretrained(model_path, 
             torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
@@ -243,12 +264,31 @@ if __name__ == '__main__':
             print('waiting for batch...'); time.sleep(1)
             batch = get_batch()
 
-        loss = GRPO_step(batch)
+        loss, avg_kl = GRPO_step(batch)
         engine.backward(loss)
         engine.step()
 
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss.item():.6f}")
+            # collect latest gen info
+            gen_info = {}
+            while True:
+                try: gen_info = info_Q.get_nowait()
+                except: break
+            log_data = {'train/loss': loss.item(), 'train/kl': avg_kl.item()}
+            log_data.update({f'reward/{k}': v for k, v in gen_info.items() if k != 'sample_answer'})
+            if step % 50 == 0 and 'sample_answer' in gen_info:
+                log_data['sample/answer'] = swanlab.Text(gen_info['sample_answer'])
+            if step % 10 == 0:
+                log_gpu_memory()
+                r = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+                                     capture_output=True, text=True)
+                mems = [float(x.strip()) for x in r.stdout.strip().split('\n') if x.strip()]
+                log_data['gpu/max_memory_mb'] = max(mems) if mems else 0
+            swanlab.log(log_data, step=step)
+            if not p.is_alive():
+                print(f'[WARNING] gen_worker died at step {step}, restarting...')
+                p = launch_gen()
 
         if step % gen_update_steps == 0:
             dist.barrier()
@@ -263,9 +303,12 @@ if __name__ == '__main__':
             dist.barrier()
             if dist.get_rank() == 0:
                 print('saving model')
-                save_name = f"./step_{step}"
+                save_name = f"./ckpts/step_{step}"
                 state_dict = engine.module.state_dict()
                 state_dict = type(state_dict)({k: v.cpu() for k, v in state_dict.items()})
                 engine.module.save_pretrained(save_name, state_dict=state_dict)
                 tokenizer.save_pretrained(save_name)
             dist.barrier()
+
+    if dist.get_rank() == 0:
+        swanlab.finish()
