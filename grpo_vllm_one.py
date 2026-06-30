@@ -161,13 +161,17 @@ def gen_worker(Q, physics_device, info_Q):
         prompts = [x["Q"] for x in inputs]
         answers, ans_token_ids = gen_answers(prompts)
         rewards = []
+        acc_scores = []
+        format_scores = []
         for i, inp in enumerate(inputs):
             for a in answers[i*num_pre_Q:(i+1)*num_pre_Q]:
-                rewards.append(reward_correct(inp, a) + reward_format(inp, a))
+                acc_scores.append(reward_correct(inp, a))
+                format_scores.append(reward_format(inp, a))
+                rewards.append(acc_scores[-1] + format_scores[-1])
         prompts_text = [tokenizer.apply_chat_template([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
-        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
+        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids, torch.tensor(acc_scores, dtype=torch.float32), torch.tensor(format_scores, dtype=torch.float32)
 
     def try_update_model():
         try:
@@ -186,12 +190,14 @@ def gen_worker(Q, physics_device, info_Q):
         if it % 3 == 0: try_update_model()
         inputs = random.sample(QAs, Q_batch_size)
         tic = time.time()
-        prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
+        prompt_inputs, rewards, answers, ans_token_ids, acc_scores, format_scores = gen_samples(inputs)
         print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, )
         if it % 5 == 0: print('answers:', answers[0])
         rw = torch.tensor(rewards)
         info_Q.put({'reward_mean': rw.mean().item(), 'reward_max': rw.max().item(),
                      'reward_min': rw.min().item(), 'reward_acc': (rw > 0).float().mean().item(),
+                     'acc_ratio': (acc_scores > 0).float().mean().item(),
+                     'format_ratio': (format_scores > 0).float().mean().item(),
                      'sample_answer': answers[0][:500]})
 
         for i, pp in enumerate(prompt_inputs):
