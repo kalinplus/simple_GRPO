@@ -64,41 +64,59 @@ def get_batch():
     return data
 
 def get_per_token_logps(logits, input_ids):
+    """
+    gather the log probabilities for each token in input_ids (correct answers) from the logits
+    @param logits: (B, L-1, V), the logits for each token
+    @param input_ids: (B, L-1), the input token ids for which to gather log probabilities
+    @return: (B, L-1), the log probabilities for each token in input_ids
+    """
     per_token_logps = [] # Use a loop to reduce memory peak.
-    for logits_row, input_ids_row in zip(logits, input_ids):
-        log_probs = logits_row.log_softmax(dim=-1)
-        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+    for logits_row, input_ids_row in zip(logits, input_ids):  # for each sample in the batch
+        log_probs = logits_row.log_softmax(dim=-1)  # logits 是未经 softmax 的
+        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)  # (L-1,)
         per_token_logps.append(token_log_prob)
-    return torch.stack(per_token_logps)
+    return torch.stack(per_token_logps)  # (B, L-1)
 #from kernel.ce_kernel import fast_log_softmax_gather
 #get_per_token_logps = fast_log_softmax_gather
 
 def GRPO_step(batch):
-    prompt_length = batch['plen']
-    inputs = batch['inputs'].to(engine.device)
-    advantages = batch['rewards'].to(engine.device).unsqueeze(1)
+    """
+    calculate GRPO loss
+
+    @param: batch(dict): contains batch of prompts lengths, input ids, normalized advantanges, ref logps
+    """
+    prompt_length = batch['plen']  # (B,), prompt length
+    inputs = batch['inputs'].to(engine.device)  # (B, L): prompt+answer 的 token ids
+    advantages = batch['rewards'].to(engine.device).unsqueeze(1)  # (B, 1), normalized advantages，是每条回答一个
     logits = engine(inputs).logits
     logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
     input_ids = inputs[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it 
-    per_token_logps = get_per_token_logps(logits, input_ids)
-    per_token_logps = per_token_logps[:,prompt_length-1:]
-    ref_per_token_logps = batch['refs'].to(per_token_logps.device)
+    per_token_logps = get_per_token_logps(logits, input_ids)  # (B, L-1), 每个位置的 log probability
+    per_token_logps = per_token_logps[:,prompt_length-1:]  # (B, answer_length), 只保留 answer 部分的 log probability, 由 \pi_\theta 生成
+    ref_per_token_logps = batch['refs'].to(per_token_logps.device)  # (B, answer_length), 由 reference model 生成的 log probability
+    # KL 散度的展开近似: KL(p || q) = \sum p * (log p - log q) ≈ exp(log q - log p) - (log q - log p) - 1，是逐 token 的
     per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-    completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
+    completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()  # (B, L), 掩码，只计算 answer 部分的 loss，忽略 padding 和 prompt 部分
     if 'gen_logps' in batch:
-        ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
+        # batch['gen_logps'] 是由 gen worker 中的模型产生的，每 gen_update_steps, 训练 proc 会把模型参数发给 gen worker，gen worker 用其（介于 actor 和 ref 之间的半旧模型）生成样本并计算 log probability 作为 \pi_{old} 的输出
+        ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))  # (B, answer_length), radio = \pi_\theta / \pi_{old}
+        # 以下两步和 PPO 的 clip 一样
         clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
-        per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
+        per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)  # (B, answer_length), advantages 被广播到了每个 token 的 loss
     else: 
+        # fallback：没有 gen_logps 时，ratio 恒为 1
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
         assert compute_gen_logps is False
-    per_token_loss = -(per_token_loss - beta * per_token_kl)
-    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-    avg_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+    per_token_loss = -(per_token_loss - beta * per_token_kl)  # 每个 token 的 loss
+    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()  # (1,) 每条回答的 loss，对 answer 长度做了归一化，然后对 batch 做平均
+    avg_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()  # (1,) 平均每个 token 的 KL 散度
     return loss, avg_kl
 
 
 def gen_worker(Q, physics_device, info_Q):
+    """
+    生成 worker：采样 prompts, 生成 num_pre_Q 个回答，计算奖励（和可能的 gen logps(用于计算 ppo-style 的 importance radio))，上传到 ref_server
+    """
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
     cleanup_keys = [  
@@ -114,6 +132,7 @@ def gen_worker(Q, physics_device, info_Q):
     for key in cleanup_keys: os.environ.pop(key, None)
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
+    
     from vllm import LLM, SamplingParams
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.4)
     ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
@@ -127,7 +146,11 @@ def gen_worker(Q, physics_device, info_Q):
     
     system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
     The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
     def gen_answers(prompts):
+        """
+        输入 prompts，将其应用对话模板，tokenize 后送入 vLLM 生成模型，返回生成的 answers 和对应的 token ids
+        """
         tip_text = []
         for x in prompts:
             tip_text.append(tokenizer.apply_chat_template([
@@ -142,6 +165,8 @@ def gen_worker(Q, physics_device, info_Q):
         return answers, ans_token_ids
 
     from math_verify import parse, verify, ExprExtractionConfig
+    # parse 把字符串解析为 SymPy 数学表达式对象，这样就能做数学等价性比较，不只是字符串匹配（比如 0.5 = 1/2 = 2^{-1})
+    # SymPy 的核心特点是可以定义符号变量，进行符号运算和简化，支持代数、微积分、方程求解等数学操作
     def reward_correct(item, answer):
         pattern = r'\d+\.\d+|\d+/\d+|\d+'
         nums = re.findall(pattern, answer) 
@@ -150,28 +175,29 @@ def gen_worker(Q, physics_device, info_Q):
         ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
         ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
         return 1 if verify(ans, ground_truth) else -1
+    
     def reward_format(item, answer):
-        pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
+        pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"  # 严格匹配 <think>...</think> <answer>...</answer>，中间可以有换行和空格
         think_count = answer.count("<think>") + answer.count("</think>")
         answer_count = answer.count("<answer>") + answer.count("</answer>")
         return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else -1
 
 
     def gen_samples(inputs):
+        """
+        输入 prompts (inputs), 按 num_pre_Q 作为 batch 生成答案，计算奖励，返回 prompts_text, rewards, answers, ans_token_ids
+        """
         prompts = [x["Q"] for x in inputs]
         answers, ans_token_ids = gen_answers(prompts)
         rewards = []
-        acc_scores = []
-        format_scores = []
         for i, inp in enumerate(inputs):
             for a in answers[i*num_pre_Q:(i+1)*num_pre_Q]:
-                acc_scores.append(reward_correct(inp, a))
-                format_scores.append(reward_format(inp, a))
-                rewards.append(acc_scores[-1] + format_scores[-1])
+                # 根据答案，用两个函数（结果+格式验证器）计算奖励
+                rewards.append(reward_correct(inp, a) + reward_format(inp, a))
         prompts_text = [tokenizer.apply_chat_template([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
-        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids, torch.tensor(acc_scores, dtype=torch.float32), torch.tensor(format_scores, dtype=torch.float32)
+        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
 
     def try_update_model():
         try:
@@ -190,35 +216,40 @@ def gen_worker(Q, physics_device, info_Q):
         if it % 3 == 0: try_update_model()
         inputs = random.sample(QAs, Q_batch_size)
         tic = time.time()
-        prompt_inputs, rewards, answers, ans_token_ids, acc_scores, format_scores = gen_samples(inputs)
+        prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
         print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, )
         if it % 5 == 0: print('answers:', answers[0])
         rw = torch.tensor(rewards)
         info_Q.put({'reward_mean': rw.mean().item(), 'reward_max': rw.max().item(),
                      'reward_min': rw.min().item(), 'reward_acc': (rw > 0).float().mean().item(),
-                     'acc_ratio': (acc_scores > 0).float().mean().item(),
-                     'format_ratio': (format_scores > 0).float().mean().item(),
                      'sample_answer': answers[0][:500]})
 
         for i, pp in enumerate(prompt_inputs):
             prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
-            plen = prompt_ids.shape[1]
+            plen = prompt_ids.shape[1]  # prompt length
+            # 每个 prompt 生成 num_pre_Q 个答案，计算奖励后，按 prompt 分组上传到 ref_server
+            # 所有 prompt 的 num_pre_Q 个回答都展平放在一个列表里，所以要按 num_pre_Q 分片
+            # 恢复 prmopt -> num_pre_Q 个回答的对应关系
             curr_answers = answers[i*num_pre_Q:(i+1)*num_pre_Q]
             curr_ans_ids = ans_token_ids[i*num_pre_Q:(i+1)*num_pre_Q]
             curr_rewards = rewards[i*num_pre_Q:(i+1)*num_pre_Q]
             if curr_rewards.max() - curr_rewards.min() < 1e-4: continue
 
-            if ref_server_ver == 'tensor':
+            if ref_server_ver == 'tensor':  # 传给 ref server, 直接传 token ids tensor 是正常高效路径
+                # 计算 advantanges
                 curr_rewards = (curr_rewards - curr_rewards.mean()) / (curr_rewards.std() + 1e-4)
+                # 把生成好的样本按 train_batch_size 分片上传到 ref_server
                 for ii in range(0, num_pre_Q, train_batch_size):
                     sub_rewards = curr_rewards[ii:ii+train_batch_size]
                     sub_ans_ids = curr_ans_ids[ii:ii+train_batch_size]
                     tensor_list = [torch.tensor(lst) for lst in sub_ans_ids]
-                    output_ids = pad_sequence(tensor_list, batch_first=True, padding_value=tokenizer.pad_token_id) 
-                    Qrep = prompt_ids.repeat(1, output_ids.shape[0]).view(-1, plen)
-                    merged_ids = torch.cat([Qrep, output_ids], dim=1)
+                    output_ids = pad_sequence(tensor_list, batch_first=True, padding_value=tokenizer.pad_token_id)  # batch 内部 padding 对齐
+                    Qrep = prompt_ids.repeat(1, output_ids.shape[0]).view(-1, plen)  # prompts 复制 B 份对齐
+                    merged_ids = torch.cat([Qrep, output_ids], dim=1)  # 拼接为完整 prompt + answer 的 token ids
                     data = [json.dumps({"plen": plen}).encode(), tensor_to_bytes(merged_ids), tensor_to_bytes(sub_rewards)]       
 
+                    # 如果要计算 generator 的 log-probs, 就用 vllm 重新算一遍
+                    # 用在训练时，计算重要性采样的 radio
                     if compute_gen_logps:
                         zz = vllm_gen.generate(prompt_token_ids=merged_ids.tolist(), sampling_params=gen_logps_sp, use_tqdm=False)
                         zz = [xx.prompt_logprobs[plen:] for xx in zz]
@@ -259,6 +290,7 @@ if __name__ == '__main__':
     model = AutoModelForCausalLM.from_pretrained(model_path, 
             torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
 
+    # engine 是 deepspeed 对 model (AutoModelForCausalLM) 的封装，optimizer 是 deepspeed 对 optimizer 的封装
     engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, 
                                                 model_parameters=model.parameters())
 
