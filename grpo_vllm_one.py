@@ -16,7 +16,7 @@ all_steps = 1000
 Q_batch_size = 5
 num_pre_Q = 8
 train_batch_size = 1
-gen_update_steps = 16
+gen_update_steps = 16  # gen model 每 16 步同步一次参数，在线和离线生成数据的中间状态。注意和 grad acc = 16 是相同的，也就是每真正更新一次参数，就同步 gen model
 save_steps = 200
 compute_gen_logps = True
 clip_param = 0.2
@@ -31,7 +31,7 @@ def log_gpu_memory():
 
 ds_config = {
     "train_micro_batch_size_per_gpu": train_batch_size,
-    "gradient_accumulation_steps": 16,
+    "gradient_accumulation_steps": 16,  # 这样做 1000 steps, 其实等价于 batch=16 做 62 个 steps，消耗数据量是相同的
     "optimizer": {
         "type": "AdamW",
         "params": { "lr": 1e-6 }
@@ -51,6 +51,9 @@ ds_config = {
 }
 
 def get_batch():
+    """
+    从 refer server /get 得到训练数据
+    """
     try:
         r = requests.get(f"{ref_server}/get").content
         if r == b'empty': return None
@@ -272,6 +275,7 @@ if __name__ == '__main__':
     deepspeed.init_distributed()
 
     if dist.get_rank() == 0:
+        # ref 和 gen worker 都只在 rank0, 所以同步 gen worker 也只能在 rank0
         print('\nSTART vLLM generation...\n')
         mp.set_start_method('spawn')
         Q = mp.Queue()
@@ -280,7 +284,7 @@ if __name__ == '__main__':
             pp = mp.Process(target=gen_worker, args=(Q, gen_device, info_Q))
             pp.start()
             return pp
-        p = launch_gen()
+        p = launch_gen()  # 启动 gen worker 进程，生成样本并上传到 ref_server
         swanlab.init(project="GRPO-GSM8K", experiment_name=f"Qwen2.5-3B_{time.strftime('%m%d_%H%M')}",
                       config={'model': model_path, 'lr': 1e-6, 'beta': beta, 'clip': clip_param,
                               'batch_size': train_batch_size, 'grad_acc': ds_config['gradient_accumulation_steps'],
@@ -295,16 +299,16 @@ if __name__ == '__main__':
                                                 model_parameters=model.parameters())
 
     progress = range(1, all_steps+1)
-    if dist.get_rank() == 0: progress = tqdm(progress)
+    if dist.get_rank() == 0: progress = tqdm(progress)  # dist.get_rank() == 0 的进程才显示进度条，避免多进程同时打印干扰
     for step in progress:
         batch = get_batch()
         while batch is None:
             print('waiting for batch...'); time.sleep(1)
             batch = get_batch()
 
-        loss, avg_kl = GRPO_step(batch)
-        engine.backward(loss)
-        engine.step()
+        loss, avg_kl = GRPO_step(batch)  # 计算 GRPO loss 和平均 KL 散度
+        engine.backward(loss)  # 算出 grad
+        engine.step()  #  更新参数
 
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss.item():.6f}")
@@ -315,8 +319,10 @@ if __name__ == '__main__':
                 except: break
             log_data = {'train/loss': loss.item(), 'train/kl': avg_kl.item()}
             log_data.update({f'reward/{k}': v for k, v in gen_info.items() if k != 'sample_answer'})
+            # 采样一条回答看看情况
             if step % 50 == 0 and 'sample_answer' in gen_info:
                 log_data['sample/answer'] = swanlab.Text(gen_info['sample_answer'])
+            # 看看 gpu 占用
             if step % 10 == 0:
                 log_gpu_memory()
                 r = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
@@ -329,15 +335,17 @@ if __name__ == '__main__':
                 p = launch_gen()
 
         if step % gen_update_steps == 0:
-            dist.barrier()
+            # 同步 gen worker 参数
+            dist.barrier()  # 同步栅栏，强制同步所有分片的状态
             if dist.get_rank() == 0:
                 print('[TRAINING PROC] sending latest state_dict ...')
                 state_dict = engine.module.state_dict()
                 Q.put(state_dict)
                 print('[TRAINING PROC] send state_dict ok!')
-            dist.barrier()
+            dist.barrier()  # 所以 rank0 还在往 Q 里放 state_dict, 其他 rank 等待，确保其他 rank 不会提前 all-reduce 和等待，两边都要求写，死锁
 
         if step % save_steps == 0:
+            # 保存 ckpt
             dist.barrier()
             if dist.get_rank() == 0:
                 print('saving model')

@@ -51,6 +51,7 @@ if __name__ == '__main__':
             per_token_logps.append(token_log_prob)
         return torch.stack(per_token_logps)
 
+    # 默认 maxsize=0，也就是无界；Lifo 的意思是，get 时永远取最后放进去的那条（后进先出），从而达到 on-policy RL 想要的效果：最新策略分布生成的数据先用
     raw_queue = queue.LifoQueue()
     result_queue = queue.LifoQueue()
 
@@ -58,6 +59,9 @@ if __name__ == '__main__':
 
     @app.route('/upload', method='POST')
     def do_upload():
+        """
+        gen worker 使用，接受其POST 来的 batch，拆解后塞进 raw_queue, 等主循环算 log-probs
+        """
         dd = request.body.read()
         dd = bytes_list_to_list(dd)
         if len(dd) not in (3,4): return b'tensor'
@@ -72,16 +76,29 @@ if __name__ == '__main__':
 
     @app.route('/get', method='GET')
     def do_get():
+        """
+        训练进程使用，轮询拿数据；空则阻塞
+        """
         if result_queue.empty(): return b'empty'
         return result_queue.get()
     
-    def run_server(): bottle.run(app, host='0.0.0.0', port=59875, server='tornado')
+    def run_server(): 
+        """
+        用独立线程跑 bottle server，避免阻塞主循环
+        这个进程真正做的事在 while True: 循环里
+        """
+        bottle.run(app, host='0.0.0.0', port=59875, server='tornado')
     threading.Thread(target=run_server, daemon=False).start()
 
     while True:
+        """
+        计算 ref model 的 log-probs 并返回给训练进程
+        训练进程会把数据塞进 raw_queue, 这个循环从 raw_queue 里拿数据，计算 log-probs 后塞进 result_queue
+        """
         d = raw_queue.get()
         prompt_length = d['base']['plen']
         with torch.inference_mode():
+            # 获取 ref model 对每个 token 的 log-probs
             per_token_logps = get_per_token_logps(d['inputs'].to(ref_model.device))
         per_token_logps = per_token_logps[:,prompt_length-1:]
         data = [json.dumps(d['base']).encode(), tensor_to_bytes(d['inputs']), 
