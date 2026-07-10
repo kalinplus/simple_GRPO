@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import json, os, shutil, re, random, io, requests, ctypes, sys, time, struct, subprocess
 import swanlab
 import torch
@@ -172,7 +172,27 @@ def gen_worker(Q, physics_device, info_Q):
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.4)
     ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
 
-    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
+    # ---- 在采样阶段就禁止生成“死区” token，从源头杜绝越界 id ----
+    # Qwen2.5 的 lm_head/embedding 被填充到 64 的倍数（config.vocab_size=151936），
+    # 而 tokenizer 实际定义的 token 数（len(tokenizer)）更小，二者之间的 id 区间
+    # 没有任何字符串含义——是“死区”。但它们仍是合法的 embedding 行，所以采样器可能
+    # 把它们挑出来；一旦这些 id 回灌到第二次 vLLM pass（作为 prompt_token_ids 计算
+    # prompt_logprobs）就会触发 V1 的 `max_input_id > tokenizer.max_token_id` 校验而
+    # 崩溃（“Token id X is out of vocabulary”）。
+    #
+    # 用 logit_bias 把死区 id 钳到 -100（softmax 后概率≈0，等价于硬掩码）。这是 vLLM
+    # V1 原生支持的写法——V1 拒绝 per-request 的 logits_processors，但接受 logit_bias
+    # （仅校验 id 落在 [0, vocab_size) 内，由引擎内部用 GPU 算子批量施加）。
+    full_vocab_size = AutoConfig.from_pretrained(model_path).vocab_size   # 填充后的词表大小
+    valid_vocab_size = len(tokenizer)                                     # tokenizer 真正定义的 token 数
+    if valid_vocab_size < full_vocab_size:
+        dead_zone_bias = {tid: -100.0 for tid in range(valid_vocab_size, full_vocab_size)}
+        print(f'[VLLM PROC] logit_bias forbids dead-zone ids [{valid_vocab_size}, {full_vocab_size}) '
+              f'({len(dead_zone_bias)} ids)')
+    else:
+        dead_zone_bias = None  # 词表无填充死区时，不施加任何 bias
+
+    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700, logit_bias=dead_zone_bias)
     gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
 
     from datasets import load_dataset
