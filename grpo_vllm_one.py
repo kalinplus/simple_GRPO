@@ -21,6 +21,23 @@ save_steps = 200
 compute_gen_logps = True
 clip_param = 0.2
 ref_server = "http://localhost:59875"
+
+# ---- Reward 配置（对应 docs/GRPO_LEARNING_GUIDE.md §6.4 reward 设计实验）----
+# 结果（正确性）reward 的开关与数值
+use_correct_reward = True
+reward_correct_right = 1.0   # 答对给多少
+reward_correct_wrong = -1.0  # 答错 / 没提取到数字给多少
+# 格式 reward 的开关与数值
+use_format_reward = True
+reward_format_right = 1.25   # <think>...</think><answer>...</answer> 格式正确给多少
+reward_format_wrong = -1.0   # 格式不对给多少
+
+# ---- Checkpoint 保存配置 ----
+# ckpt 存到 {save_dir}/{run_tag}/step_{step}。run_tag=None 时用 build_run_tag() 自动拼接常用参数，
+# 这样不同实验（beta / num_pre_Q / lr / reward 配置）互不覆盖；想自定义直接给 run_tag 赋字符串即可。
+save_dir = "./ckpts"
+run_tag = None
+
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
 
 def log_gpu_memory():
@@ -49,6 +66,21 @@ ds_config = {
         "offload_optimizer": {"device": "cpu"}
     }
 }
+
+def build_run_tag():
+    """根据常用参数自动拼一个 run_tag，用作 ckpt 子目录名和 swanlab 实验名后缀，
+    让不同实验（beta / num_pre_Q / lr / reward 配置）存到不同目录、互不覆盖。"""
+    model_name = os.path.basename(model_path.rstrip('/'))
+    lr = ds_config["optimizer"]["params"]["lr"]
+    parts = [model_name, f"beta{beta}", f"G{num_pre_Q}", f"lr{lr:g}"]
+    if not use_correct_reward and not use_format_reward:
+        parts.append("noreward")
+    else:
+        rsig = []
+        if use_correct_reward: rsig.append(f"cor{reward_correct_right:g}")
+        if use_format_reward:  rsig.append(f"fmt{reward_format_right:g}")
+        parts.append("+".join(rsig))
+    return "_".join(parts)
 
 def get_batch():
     """
@@ -172,18 +204,18 @@ def gen_worker(Q, physics_device, info_Q):
     # SymPy 的核心特点是可以定义符号变量，进行符号运算和简化，支持代数、微积分、方程求解等数学操作
     def reward_correct(item, answer):
         pattern = r'\d+\.\d+|\d+/\d+|\d+'
-        nums = re.findall(pattern, answer) 
-        if len(nums) == 0: return -1.0
+        nums = re.findall(pattern, answer)
+        if len(nums) == 0: return reward_correct_wrong
         lastnum = nums[-1]
         ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
         ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
-        return 1 if verify(ans, ground_truth) else -1
-    
+        return reward_correct_right if verify(ans, ground_truth) else reward_correct_wrong
+
     def reward_format(item, answer):
         pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"  # 严格匹配 <think>...</think> <answer>...</answer>，中间可以有换行和空格
         think_count = answer.count("<think>") + answer.count("</think>")
         answer_count = answer.count("<answer>") + answer.count("</answer>")
-        return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else -1
+        return reward_format_right if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else reward_format_wrong
 
 
     def gen_samples(inputs):
@@ -195,8 +227,11 @@ def gen_worker(Q, physics_device, info_Q):
         rewards = []
         for i, inp in enumerate(inputs):
             for a in answers[i*num_pre_Q:(i+1)*num_pre_Q]:
-                # 根据答案，用两个函数（结果+格式验证器）计算奖励
-                rewards.append(reward_correct(inp, a) + reward_format(inp, a))
+                # 根据答案，按开关用结果/格式验证器计算奖励
+                r = 0.0
+                if use_correct_reward: r += reward_correct(inp, a)
+                if use_format_reward:  r += reward_format(inp, a)
+                rewards.append(r)
         prompts_text = [tokenizer.apply_chat_template([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
@@ -285,11 +320,18 @@ if __name__ == '__main__':
             pp.start()
             return pp
         p = launch_gen()  # 启动 gen worker 进程，生成样本并上传到 ref_server
-        swanlab.init(project="GRPO-GSM8K", experiment_name=f"Qwen2.5-3B_{time.strftime('%m%d_%H%M')}",
-                      config={'model': model_path, 'lr': 1e-6, 'beta': beta, 'clip': clip_param,
+        if run_tag is None: run_tag = build_run_tag()
+        print(f'[RUN] run_tag = {run_tag}    (ckpt -> {save_dir}/{run_tag}/step_*)')
+        swanlab.init(project="GRPO-GSM8K", experiment_name=f"{run_tag}_{time.strftime('%m%d_%H%M')}",
+                      config={'model': model_path, 'run_tag': run_tag,
+                              'lr': ds_config['optimizer']['params']['lr'], 'beta': beta, 'clip': clip_param,
                               'batch_size': train_batch_size, 'grad_acc': ds_config['gradient_accumulation_steps'],
                               'gen_update_steps': gen_update_steps, 'num_pre_Q': num_pre_Q,
-                              'Q_batch_size': Q_batch_size, 'max_tokens': 700})
+                              'Q_batch_size': Q_batch_size, 'max_tokens': 700,
+                              'use_correct_reward': use_correct_reward, 'reward_correct_right': reward_correct_right,
+                              'reward_correct_wrong': reward_correct_wrong,
+                              'use_format_reward': use_format_reward, 'reward_format_right': reward_format_right,
+                              'reward_format_wrong': reward_format_wrong})
 
     model = AutoModelForCausalLM.from_pretrained(model_path, 
             torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
@@ -345,11 +387,11 @@ if __name__ == '__main__':
             dist.barrier()  # 所以 rank0 还在往 Q 里放 state_dict, 其他 rank 等待，确保其他 rank 不会提前 all-reduce 和等待，两边都要求写，死锁
 
         if step % save_steps == 0:
-            # 保存 ckpt
+            # 保存 ckpt 到 {save_dir}/{run_tag}/step_{step}，run_tag 由常用参数拼接，避免不同实验互相覆盖
             dist.barrier()
             if dist.get_rank() == 0:
-                print('saving model')
-                save_name = f"./ckpts/step_{step}"
+                save_name = f"{save_dir}/{run_tag}/step_{step}"
+                print(f'saving model to {save_name}')
                 state_dict = engine.module.state_dict()
                 state_dict = type(state_dict)({k: v.cpu() for k, v in state_dict.items()})
                 engine.module.save_pretrained(save_name, state_dict=state_dict)

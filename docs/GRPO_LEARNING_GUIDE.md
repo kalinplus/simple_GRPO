@@ -456,7 +456,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6 deepspeed grpo_vllm_one.py
 
 默认 `all_steps=1000`，每 `gen_update_steps=16` 步同步一次权重，每 `save_steps=200` 步存档一次。
 
-存档位置：`./step_200/`、`./step_400/`、`...`、`./step_1000/`。
+存档位置：`./ckpts/{run_tag}/step_200/`、`.../step_400/`、`...`、`.../step_1000/`。`run_tag` 由常用参数自动拼接（见 §5.6），不同实验互不覆盖；想固定名字可直接给 `run_tag` 赋字符串。
 
 ---
 
@@ -496,14 +496,20 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6 deepspeed grpo_vllm_one.py
 | `temperature` | `0.9` | `SamplingParams` | 生成温度。0.9 偏探索，让回答更多样 |
 | `max_tokens` | `700` | `SamplingParams` | 每个回答最大 token 数 |
 
-### 5.4 Reward 函数参数（硬编码）
+### 5.4 Reward 函数参数（可配置，对应 §6.4 实验）
 
-| 参数 | 值 | 含义 |
+在脚本顶部有一组开关 + 数值，默认值复刻原始行为（`reward_correct + reward_format`）。改这几个变量即生效，不用动函数体。
+
+| 变量 | 默认 | 含义 |
 |---|---|---|
-| 正确答案 reward | `+1.0` | `reward_correct` |
-| 错误答案 reward | `-1.0` | `reward_correct` |
-| 格式正确 reward | `+1.25` | `reward_format`（比正确性权重略高） |
-| 格式错误 reward | `-1.0` | `reward_format` |
+| `use_correct_reward` | `True` | 结果（正确性）reward 总开关。关掉后该项贡献为 0 |
+| `reward_correct_right` | `1.0` | 答对给多少 |
+| `reward_correct_wrong` | `-1.0` | 答错 / 没提取到数字给多少 |
+| `use_format_reward` | `True` | 格式 reward 总开关。关掉后该项贡献为 0 |
+| `reward_format_right` | `1.25` | `<think>...</think><answer>...</answer>` 格式正确给多少（比正确性权重略高） |
+| `reward_format_wrong` | `-1.0` | 格式不对给多少 |
+
+> 总 reward = （`use_correct_reward` 开时）`reward_correct` + （`use_format_reward` 开时）`reward_format`。两个开关都关会让所有 reward=0、组内方差=0，样本全被跳过 → 训练卡在 `waiting for batch...`，别这么配。
 
 ### 5.5 调参注意事项（学 GRPO 最该记住的几点）
 
@@ -513,6 +519,18 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6 deepspeed grpo_vllm_one.py
 4. **`lr` 要比 SFT 小一个量级**。RL 的梯度噪声大，1e-6 是安全起点。太大容易 loss 爆炸。
 5. **先格式后内容**：初期 `reward_format` 占主导（因为随机初始化的模型很难答对数学题），训练中后期 `reward_correct` 逐渐起作用。观察 SwanLab 的 `reward/mean` 曲线可以看到这个转折。
 6. **`compute_gen_logps` 必须为 True**。否则没有 importance ratio clipping，等价于无约束的策略更新，容易不稳定。
+
+### 5.6 Checkpoint 保存路径与 run_tag
+
+ckpt 存到 `{save_dir}/{run_tag}/step_{step}`（默认 `save_dir="./ckpts"`）。`run_tag` 由 `build_run_tag()` 自动拼接常用参数，例如默认配置得到：
+
+```
+Qwen2.5-3B_beta0.04_G8_lr1e-06_cor1+fmt1.25
+```
+
+- 改了 `beta` / `num_pre_Q` / `lr` / reward 开关或权重 → `run_tag` 自动变 → 存到不同子目录、SwanLab 也是不同实验，互不覆盖。
+- 想固定一个名字（比如自己起个实验代号），直接 `run_tag = "my_exp"` 覆盖即可，不再自动拼接。
+- 想换存盘根目录，改 `save_dir`。
 
 ---
 
@@ -551,9 +569,27 @@ gen_update_steps = 4
 
 ### 6.4 reward 设计实验
 
-- **去掉 format reward**：只留 `reward_correct`，看模型能不能自己学会格式
-- **交换权重**：`correct=1.25, format=1.0`，看是否影响训练动态
-- **三元 reward**：`correct=2, format_only=0.5, wrong=-2`（REINFORCE++ 的设计），对比效果
+直接改脚本顶部那组变量（见 §5.4），每个实验还会自动得到独立的 `run_tag`，ckpt 和 SwanLab 实验都不会互相覆盖：
+
+- **去掉 format reward**（看模型能不能自己学会格式）：
+  ```python
+  use_format_reward = False
+  ```
+- **交换权重**（correct 比 format 更重）：
+  ```python
+  reward_correct_right = 1.25
+  reward_format_right  = 1.0
+  ```
+- **三元 reward**（REINFORCE++ 风格，拉大正负差距）：
+  ```python
+  reward_correct_right = 2.0
+  reward_correct_wrong = -2.0
+  reward_format_right  = 0.5
+  ```
+- **只学格式、不学答案**（初期把模型「按住」在格式上）：
+  ```python
+  use_correct_reward = False
+  ```
 
 ### 6.5 关闭 clipping 的对照
 

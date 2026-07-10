@@ -55,11 +55,11 @@ This just uses one GPU to collect and run the reference model.
 
 In *grpo_vllm_one.py*, set the generation device index ​relative to the visible devices​ in next step:
 ``` bash
-gen_device = 1
+gen_device = 0
 ```
 Then, open another bash:
 ``` bash
-CUDA_VISIBLE_DEVICES=2,3,4,5,6 deepspeed grpo_vllm_one.py
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 deepspeed grpo_vllm_one.py
 ```
 ## ✨ Experimental Results
 
