@@ -5,6 +5,6 @@ sentencepiece
 tokenizers
 torch
 tornado
-transformers
+transformers>=4.55,<5.0  # vllm 0.10.1.1 不兼容 transformers v5（all_special_tokens_extended 等 API 被移除）
 vllm==0.10.1.1
 deepspeed

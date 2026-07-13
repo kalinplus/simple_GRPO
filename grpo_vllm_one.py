@@ -9,18 +9,19 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-model_path = "./models/Qwen/Qwen2.5-3B"
-gen_device = 7    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
+model_path = "./models/Qwen/Qwen2.5-7B"
+gen_device = 0    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
 beta = 0.04
 all_steps = 1000
 Q_batch_size = 5
 num_pre_Q = 8
-train_batch_size = 1
+train_batch_size = 2
 gen_update_steps = 16  # gen model 每 16 步同步一次参数，在线和离线生成数据的中间状态。注意和 grad acc = 16 是相同的，也就是每真正更新一次参数，就同步 gen model
 save_steps = 200
 compute_gen_logps = True
 clip_param = 0.2
-ref_server = "http://localhost:59875"
+# ref_server 的端口配置从 ref_server.py 统一读取（base_port / max_port_retries）。
+# 服务端启动时若 base_port 被占用会自动顺延，客户端这边扫描同样的范围跟上。
 
 # ---- Reward 配置（对应 docs/GRPO_LEARNING_GUIDE.md §6.4 reward 设计实验）----
 # 结果（正确性）reward 的开关与数值
@@ -39,6 +40,33 @@ save_dir = "./ckpts"
 run_tag = None
 
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
+from ref_server import base_port as ref_base_port, max_port_retries as ref_max_port_retries
+
+# ref_server 端口自适应：首次连上后缓存端口，之后直接用；连不上就在
+# [ref_base_port, ref_base_port + ref_max_port_retries] 里重试。spawn 出来的 gen_worker
+# 子进程有自己的一份 _ref_port，会各自扫到同一个端口。
+_ref_port = None   # 缓存：首次成功连接后记下的 ref_server 端口
+
+def _do_ref_request(method, path, **kw):
+    """
+    对 ref_server 发 get/post 请求，端口自适应。
+    先试缓存的 _ref_port；连不上再扫 [ref_base_port, ref_base_port+ref_max_port_retries]。
+    全部端口都连不上时抛出最后一个异常（调用方 try/except 处理，如 get_batch 返回 None）。
+    """
+    global _ref_port
+    ports = ([_ref_port] if _ref_port is not None else []) + \
+            [p for p in range(ref_base_port, ref_base_port + ref_max_port_retries + 1)
+             if p != _ref_port]
+    kw.setdefault('timeout', 5)
+    last_err = None
+    for p in ports:
+        try:
+            r = getattr(requests, method)(f"http://localhost:{p}{path}", **kw)
+            _ref_port = p   # 连上了，缓存这个端口
+            return r
+        except requests.exceptions.RequestException as e:
+            last_err = e
+    raise last_err
 
 def log_gpu_memory():
     r = subprocess.run(['nvidia-smi', '--query-gpu=index,memory.used,memory.total', '--format=csv,noheader,nounits'], capture_output=True, text=True)
@@ -87,7 +115,7 @@ def get_batch():
     从 refer server /get 得到训练数据
     """
     try:
-        r = requests.get(f"{ref_server}/get").content
+        r = _do_ref_request('get', '/get').content
         if r == b'empty': return None
     except: return None
     dd = bytes_list_to_list(r)
@@ -148,7 +176,7 @@ def GRPO_step(batch):
     return loss, avg_kl
 
 
-def gen_worker(Q, physics_device, info_Q):
+def gen_worker(Q, physics_device, info_Q, stop_event):
     """
     生成 worker：采样 prompts, 生成 num_pre_Q 个回答，计算奖励（和可能的 gen logps(用于计算 ppo-style 的 importance radio))，上传到 ref_server
     """
@@ -271,6 +299,9 @@ def gen_worker(Q, physics_device, info_Q):
         
     from torch.nn.utils.rnn import pad_sequence
     for it in range(999999999):
+        if stop_event.is_set():
+            print('[VLLM PROC] stop signal received, exiting gen_worker gracefully...')
+            break
         if it % 3 == 0: try_update_model()
         inputs = random.sample(QAs, Q_batch_size)
         tic = time.time()
@@ -280,7 +311,7 @@ def gen_worker(Q, physics_device, info_Q):
         rw = torch.tensor(rewards)
         info_Q.put({'reward_mean': rw.mean().item(), 'reward_max': rw.max().item(),
                      'reward_min': rw.min().item(), 'reward_acc': (rw > 0).float().mean().item(),
-                     'sample_answer': answers[0][:500]})
+                     'sample_answer': answers[0]})
 
         for i, pp in enumerate(prompt_inputs):
             prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
@@ -315,12 +346,12 @@ def gen_worker(Q, physics_device, info_Q):
                         data.append(tensor_to_bytes(gen_logps))
 
                     xdata = make_bytes_list(data)
-                    r = requests.post(f"{ref_server}/upload", data=xdata)
+                    r = _do_ref_request('post', '/upload', data=xdata)
                     if r.content == b'string': ref_server_ver = 'string'
             elif ref_server_ver == 'string':
                 xdata = make_bytes_list([json.dumps({"Q": pp[0], "As": curr_answers}).encode(), 
                                         tensor_to_bytes(curr_rewards)])
-                r = requests.post(f"{ref_server}/upload", data=xdata)
+                r = _do_ref_request('post', '/upload', data=xdata)
                 if r.content == b'tensor': ref_server_ver = 'tensor'
 
 
@@ -335,8 +366,9 @@ if __name__ == '__main__':
         mp.set_start_method('spawn')
         Q = mp.Queue()
         info_Q = mp.Queue()
+        stop_event = mp.Event()   # 训练结束后主进程 set 它，通知 gen worker 优雅退出
         def launch_gen():
-            pp = mp.Process(target=gen_worker, args=(Q, gen_device, info_Q))
+            pp = mp.Process(target=gen_worker, args=(Q, gen_device, info_Q, stop_event))
             pp.start()
             return pp
         p = launch_gen()  # 启动 gen worker 进程，生成样本并上传到 ref_server
@@ -418,5 +450,15 @@ if __name__ == '__main__':
                 tokenizer.save_pretrained(save_name)
             dist.barrier()
 
+    # 所有 rank 都跑完训练循环后再进入清理；rank0 负责通知 gen worker 优雅退出
+    dist.barrier()
     if dist.get_rank() == 0:
+        print('[TRAINING PROC] training finished, signaling gen_worker to stop...')
+        stop_event.set()
+        p.join(timeout=120)   # 给 gen worker 时间把当前这一批生成做完再退出
+        if p.is_alive():
+            print('[TRAINING PROC] gen_worker did not exit in time, force terminating...')
+            p.terminate()
+            p.join(timeout=10)
+        print('[TRAINING PROC] gen_worker exited. all done.')
         swanlab.finish()

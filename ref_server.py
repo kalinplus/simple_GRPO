@@ -2,6 +2,12 @@
 import json, os, shutil, re, random, io, time
 import torch
 
+# ---- 端口配置（单一来源，grpo_vllm_one.py 的客户端会 import 这两个值并扫描同样的范围）----
+# 端口被占用时，ref_server 会自动往后顺延；最多顺延 max_port_retries 次，每次顺延打一条 warning，
+# 全部都被占用才会报错。客户端 (grpo_vllm_one.py) 会跟着扫描这个范围，所以改这里一处即可。
+base_port = 59875
+max_port_retries = 3
+
 def tensor_to_bytes(t):
     buffer = io.BytesIO()
     torch.save(t, buffer)
@@ -82,12 +88,39 @@ if __name__ == '__main__':
         if result_queue.empty(): return b'empty'
         return result_queue.get()
     
-    def run_server(): 
+    def run_server():
         """
-        用独立线程跑 bottle server，避免阻塞主循环
-        这个进程真正做的事在 while True: 循环里
+        用独立线程跑 bottle server，避免阻塞主循环。
+        端口被占用时自动往后顺延（最多 max_port_retries 次），每次顺延打一条 warning；
+        全部端口都被占用才抛 RuntimeError。客户端 (grpo_vllm_one.py) 会扫描同样的范围跟上。
+        这个进程真正做的事在 while True: 循环里。
+
+        注意：这里没有用 bottle.run(server='tornado')，而是手动搭 tornado —— 因为
+        bottle 的 TornadoServer 适配器内部直接 server.listen(port)，端口被占用就抛异常退出，
+        没法捕获。手动搭一遍就能在 listen() 外面套 try，从而实现顺延。
         """
-        bottle.run(app, host='0.0.0.0', port=59875, server='tornado')
+        import tornado.wsgi, tornado.httpserver, tornado.ioloop
+        container = tornado.wsgi.WSGIContainer(app)
+        bound_port = None
+        for offset in range(max_port_retries + 1):
+            port = base_port + offset
+            try:
+                server = tornado.httpserver.HTTPServer(container)
+                server.listen(port=port, address='0.0.0.0')
+                bound_port = port
+                break
+            except OSError as e:
+                reason = e.strerror or str(e)
+                if offset < max_port_retries:
+                    print(f"[warning] ref_server 端口 {port} 被占用（{reason}），顺延到 {port + 1} ...")
+                else:
+                    print(f"[warning] ref_server 端口 {port} 被占用（{reason}），已用尽 {max_port_retries + 1} 次尝试")
+        if bound_port is None:
+            raise RuntimeError(
+                f"ref_server 在端口 {base_port}~{base_port + max_port_retries} 全部被占用，无法启动；"
+                f"请清理占用进程或调大 max_port_retries")
+        print(f"[ref_server] listening on http://0.0.0.0:{bound_port}")
+        tornado.ioloop.IOLoop.instance().start()
     threading.Thread(target=run_server, daemon=False).start()
 
     while True:
